@@ -211,6 +211,92 @@ it('uploads again when the first upload to a destination fails', function () {
         ->and($execution->s3_uploaded)->toBeTrue();
 });
 
+it('refreshes the destination address when a connection fails before an upload succeeds', function (string $operation) {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(['id' => 0], [
+        'webhook_allowed_internal_hosts' => ['localhost'],
+        'webhook_allow_localhost' => true,
+    ]));
+    [$backup, $storage] = createMultiDestinationVolumeBackup();
+    $backup->syncS3Storages([$storage->id]);
+    $storage->update(['endpoint' => 'http://localhost:9000']);
+    fakeMultiDestinationS3Disks();
+    $probes = 0;
+    $attempts = [];
+    Process::fake(function ($process) use (&$probes, &$attempts, $operation) {
+        $script = remoteProcessScript($process);
+        if (str_contains($script, '/dev/tcp/')) {
+            return Process::result(output: ++$probes === 1 ? '127.0.0.1' : '::1');
+        }
+        if (str_contains($script, $operation)) {
+            $attempts[] = $script;
+            if (count($attempts) === 1) {
+                return Process::result(errorOutput: 'dial tcp: connect: network is unreachable', exitCode: 1);
+            }
+        }
+
+        return Process::result(output: str_contains($script, 'du -b') ? '128' : '');
+    });
+
+    (new VolumeBackupJob($backup))->handle();
+
+    expect($attempts)->toHaveCount(2);
+    expect($attempts[0])->toContain('localhost:9000=127.0.0.1');
+    expect($attempts[1])->toContain('localhost:9000=::1');
+    $this->assertDatabaseHas('scheduled_volume_backup_executions', [
+        'scheduled_volume_backup_id' => $backup->id,
+        'status' => 'success',
+        's3_uploaded' => true,
+        'message' => null,
+    ]);
+})->with([
+    'alias connection fails' => 'mc alias set',
+    'upload connection fails' => 'mc cp',
+]);
+
+it('refreshes the signed transfer configuration when a path-based destination needs another upload attempt', function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(['id' => 0], [
+        'webhook_allowed_internal_hosts' => ['localhost'],
+        'webhook_allow_localhost' => true,
+    ]));
+    [$backup, $storage] = createMultiDestinationVolumeBackup();
+    $backup->syncS3Storages([$storage->id]);
+    $storage->update(['endpoint' => 'http://localhost:9000/storage/v1/s3']);
+    $sshDisk = Storage::fake('ssh-keys');
+    $disk = Mockery::mock(FilesystemAdapter::class);
+    $disk->shouldReceive('files')->zeroOrMoreTimes()->andReturn([]);
+    $signatures = 0;
+    $disk->shouldReceive('temporaryUploadUrl')->andReturnUsing(function () use (&$signatures): array {
+        return ['url' => 'http://localhost:9000/storage/v1/s3/bucket/archive?signature='.(++$signatures)];
+    });
+    Storage::shouldReceive('disk')->with('ssh-keys')->andReturn($sshDisk);
+    Storage::shouldReceive('build')->zeroOrMoreTimes()->andReturn($disk);
+    $configurations = [];
+    $uploads = 0;
+    Process::fake(function ($process) use (&$configurations, &$uploads) {
+        if (is_string($process->input) && str_contains($process->input, 'url = ')) {
+            $configurations[] = $process->input;
+        }
+        $script = remoteProcessScript($process);
+        if (str_contains($script, 'curl --config') && ++$uploads === 1) {
+            return Process::result(errorOutput: 'could not connect to the destination', exitCode: 1);
+        }
+
+        return Process::result(output: str_contains($script, 'du -b') ? '128' : '');
+    });
+
+    (new VolumeBackupJob($backup))->handle();
+
+    expect($uploads)->toBe(2);
+    expect($configurations)->toHaveCount(2);
+    expect($configurations[0])->toContain('signature=1');
+    expect($configurations[1])->toContain('signature=2');
+    $this->assertDatabaseHas('scheduled_volume_backup_executions', [
+        'scheduled_volume_backup_id' => $backup->id,
+        's3_uploaded' => true,
+        'message' => null,
+    ]);
+});
+
 it('applies S3 retention to each destination separately', function () {
     [$backup, $first, $second, $server] = createMultiDestinationVolumeBackup([
         'retention_amount_locally' => 0,
