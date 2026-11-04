@@ -476,15 +476,18 @@ class VolumeBackupJob implements ShouldBeEncrypted, ShouldQueue
                 'docker run -d --name '.escapeshellarg($containerName).' --rm '.$s3->minioClientEnvOptions().' -v '
                     .escapeshellarg($backupLocation.':'.$backupLocation.':ro').' '.escapeshellarg($image),
             ], $server, timeout: $this->timeout, disableMultiplexing: true);
-            if ($s3->usesCurlTransfer()) {
-                $uploadCommand = $s3->prepareCurlUpload($server, $containerName, $backupLocation, ltrim($backupDirectory, '/').'/'.basename($backupLocation));
-            } else {
-                $resolveOptions = $s3->minioClientResolveOptions($server, $image);
-                $this->setMinioClientAlias($server, $containerName, $s3, $resolveOptions);
-                $uploadCommand = 'docker exec '.S3Storage::minioClientPartSizeOption($size).' '.escapeshellarg($containerName).' mc cp'.$resolveOptions.' '.escapeshellarg($backupLocation).' '
-                    .escapeshellarg('temporary/'.$s3->bucket.$backupDirectory.'/');
-            }
-            S3Storage::retryMinioClientUpload(fn () => instant_remote_process([$uploadCommand], $server, timeout: $this->timeout, disableMultiplexing: true));
+            S3Storage::retryMinioClientUpload(function () use ($s3, $server, $containerName, $backupLocation, $backupDirectory, $image, $size): ?string {
+                if ($s3->usesCurlTransfer()) {
+                    $uploadCommand = $s3->prepareCurlUpload($server, $containerName, $backupLocation, ltrim($backupDirectory, '/').'/'.basename($backupLocation));
+                } else {
+                    $resolveOptions = $s3->minioClientResolveOptions($server, $image);
+                    $this->setMinioClientAlias($server, $containerName, $s3, $resolveOptions);
+                    $uploadCommand = 'docker exec '.S3Storage::minioClientPartSizeOption($size).' '.escapeshellarg($containerName).' mc cp'.$resolveOptions.' '.escapeshellarg($backupLocation).' '
+                        .escapeshellarg('temporary/'.$s3->bucket.$backupDirectory.'/');
+                }
+
+                return instant_remote_process([$uploadCommand], $server, timeout: $this->timeout, disableMultiplexing: true);
+            });
         } finally {
             instant_remote_process(
                 ['docker rm -f '.escapeshellarg($containerName)],

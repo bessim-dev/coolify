@@ -954,20 +954,23 @@ class DatabaseBackupJob implements ShouldBeEncrypted, ShouldQueue
             $commands[] = "docker run -d --network {$safeNetwork} --name backup-of-{$this->backup_log_uuid} --rm {$s3->minioClientEnvOptions()} -v {$mount} {$fullImageName}";
 
             instant_remote_process($commands, $this->server, true, false, $this->commandTimeout(), disableMultiplexing: true);
-            if ($s3->usesCurlTransfer()) {
-                $uploadCommand = $s3->prepareCurlUpload($this->server, "backup-of-{$this->backup_log_uuid}", $this->backup_location, ltrim($this->backup_dir, '/').'/'.basename($this->backup_location));
-            } else {
-                $escapedBackupLocation = escapeshellarg($this->backup_location);
-                $escapedS3Destination = escapeshellarg("temporary/{$bucket}{$this->backup_dir}/");
-                $resolveOptions = $s3->minioClientResolveOptions($this->server, $fullImageName, $network);
-                $partSizeOption = S3Storage::minioClientPartSizeOption($this->size);
-                $this->setMinioClientAlias($this->server, "backup-of-{$this->backup_log_uuid}", $s3, $resolveOptions);
-                $uploadCommand = "docker exec {$partSizeOption} backup-of-{$this->backup_log_uuid} mc cp{$resolveOptions} {$escapedBackupLocation} {$escapedS3Destination}";
-            }
-            S3Storage::retryMinioClientUpload(fn () => instant_remote_process(
-                [$uploadCommand],
-                $this->server, true, false, $this->commandTimeout(), disableMultiplexing: true,
-            ));
+            S3Storage::retryMinioClientUpload(function () use ($s3, $bucket, $fullImageName, $network): ?string {
+                if ($s3->usesCurlTransfer()) {
+                    $uploadCommand = $s3->prepareCurlUpload($this->server, "backup-of-{$this->backup_log_uuid}", $this->backup_location, ltrim($this->backup_dir, '/').'/'.basename($this->backup_location));
+                } else {
+                    $escapedBackupLocation = escapeshellarg($this->backup_location);
+                    $escapedS3Destination = escapeshellarg("temporary/{$bucket}{$this->backup_dir}/");
+                    $resolveOptions = $s3->minioClientResolveOptions($this->server, $fullImageName, $network);
+                    $partSizeOption = S3Storage::minioClientPartSizeOption($this->size);
+                    $this->setMinioClientAlias($this->server, "backup-of-{$this->backup_log_uuid}", $s3, $resolveOptions);
+                    $uploadCommand = "docker exec {$partSizeOption} backup-of-{$this->backup_log_uuid} mc cp{$resolveOptions} {$escapedBackupLocation} {$escapedS3Destination}";
+                }
+
+                return instant_remote_process(
+                    [$uploadCommand],
+                    $this->server, true, false, $this->commandTimeout(), disableMultiplexing: true,
+                );
+            });
 
         } catch (Throwable $e) {
             $this->add_to_error_output($e->getMessage());

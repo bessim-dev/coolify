@@ -21,6 +21,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Sleep;
 
 uses(RefreshDatabase::class);
 
@@ -136,6 +137,105 @@ function createMultiS3Backup(): ScheduledDatabaseBackup
 
     return $backup->fresh();
 }
+
+it('refreshes the destination address when a database upload connection fails', function (string $operation) {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(['id' => 0], [
+        'webhook_allowed_internal_hosts' => ['localhost'],
+        'webhook_allow_localhost' => true,
+    ]));
+    $backup = createMultiS3Backup();
+    $storage = $backup->selectedS3Storages()->firstOrFail();
+    $backup->syncS3Storages([$storage->id]);
+    $storage->update(['endpoint' => 'http://localhost:9000']);
+    $sshDisk = Storage::fake('ssh-keys');
+    $disk = Mockery::mock(FilesystemAdapter::class);
+    $disk->shouldReceive('files')->zeroOrMoreTimes()->andReturn([]);
+    Storage::shouldReceive('disk')->with('ssh-keys')->andReturn($sshDisk);
+    Storage::shouldReceive('build')->zeroOrMoreTimes()->andReturn($disk);
+    Notification::fake();
+    Event::fake([BackupCreated::class]);
+    Sleep::fake();
+    $probes = 0;
+    $attempts = [];
+    Process::fake(function ($process) use (&$probes, &$attempts, $operation) {
+        $script = remoteProcessScript($process);
+        if (str_contains($script, '/dev/tcp/')) {
+            return Process::result(output: ++$probes === 1 ? '127.0.0.1' : '::1');
+        }
+        if (str_contains($script, $operation)) {
+            $attempts[] = $script;
+            if (count($attempts) === 1) {
+                return Process::result(errorOutput: 'dial tcp: connect: network is unreachable', exitCode: 1);
+            }
+        }
+
+        return Process::result(output: str_contains($script, 'du -b') ? '128' : '');
+    });
+
+    (new DatabaseBackupJob($backup))->handle();
+
+    expect($attempts)->toHaveCount(2);
+    expect($attempts[0])->toContain('localhost:9000=127.0.0.1');
+    expect($attempts[1])->toContain('localhost:9000=::1');
+    $this->assertDatabaseHas('scheduled_database_backup_executions', [
+        'scheduled_database_backup_id' => $backup->id,
+        'status' => 'success',
+        's3_uploaded' => true,
+    ]);
+    Event::assertDispatched(BackupCreated::class);
+})->with([
+    'alias connection fails' => 'mc alias set',
+    'upload connection fails' => 'mc cp',
+]);
+
+it('refreshes the signed transfer configuration when a path-based database destination needs another upload attempt', function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(['id' => 0], [
+        'webhook_allowed_internal_hosts' => ['localhost'],
+        'webhook_allow_localhost' => true,
+    ]));
+    $backup = createMultiS3Backup();
+    $storage = $backup->selectedS3Storages()->firstOrFail();
+    $backup->syncS3Storages([$storage->id]);
+    $storage->update(['endpoint' => 'http://localhost:9000/storage/v1/s3']);
+    $sshDisk = Storage::fake('ssh-keys');
+    $disk = Mockery::mock(FilesystemAdapter::class);
+    $disk->shouldReceive('files')->zeroOrMoreTimes()->andReturn([]);
+    $signatures = 0;
+    $disk->shouldReceive('temporaryUploadUrl')->andReturnUsing(function () use (&$signatures): array {
+        return ['url' => 'http://localhost:9000/storage/v1/s3/bucket/archive?signature='.(++$signatures)];
+    });
+    Storage::shouldReceive('disk')->with('ssh-keys')->andReturn($sshDisk);
+    Storage::shouldReceive('build')->zeroOrMoreTimes()->andReturn($disk);
+    Notification::fake();
+    Event::fake([BackupCreated::class]);
+    Sleep::fake();
+    $configurations = [];
+    $uploads = 0;
+    Process::fake(function ($process) use (&$configurations, &$uploads) {
+        if (is_string($process->input) && str_contains($process->input, 'url = ')) {
+            $configurations[] = $process->input;
+        }
+        $script = remoteProcessScript($process);
+        if (str_contains($script, 'curl --config') && ++$uploads === 1) {
+            return Process::result(errorOutput: 'could not connect to the destination', exitCode: 1);
+        }
+
+        return Process::result(output: str_contains($script, 'du -b') ? '128' : '');
+    });
+
+    (new DatabaseBackupJob($backup))->handle();
+
+    expect($uploads)->toBe(2);
+    expect($configurations)->toHaveCount(2);
+    expect($configurations[0])->toContain('signature=1');
+    expect($configurations[1])->toContain('signature=2');
+    $this->assertDatabaseHas('scheduled_database_backup_executions', [
+        'scheduled_database_backup_id' => $backup->id,
+        'status' => 'success',
+        's3_uploaded' => true,
+    ]);
+    Event::assertDispatched(BackupCreated::class);
+});
 
 it('applies S3 retention to each destination separately', function () {
     $team = Team::factory()->create();
